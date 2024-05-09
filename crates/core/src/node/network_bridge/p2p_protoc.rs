@@ -640,6 +640,7 @@ impl P2pConnManager {
                                 tracing::debug!(remote = %peer.addr, "Couldn't signal to the connection that is accepted, likely dropped");
                             });
                         }
+                        pending_inbound_gw_conns.remove(&peer.addr);
                     } else {
                         closing_gw_conn = pending_inbound_gw_conns.remove(&joiner.addr());
                     }
@@ -675,14 +676,6 @@ impl P2pConnManager {
                 .map_err(|_| ConnectionError::SendNotCompleted)?;
         } else {
             if let Some(conn) = self.connection.get(&peer) {
-                match &*net_msg {
-                    NetMessage::V1(NetMessageV1::Connect(ConnectMsg::Request { id, msg })) => {
-                        tracing::debug!(id=%id, target = %peer, ?msg, "XXX Sending outbound message");
-                    }
-                    _ => tracing::debug!(target = %peer, %net_msg, "Sending outbound message"),
-                };
-                // trace if conn is closed
-                tracing::debug!(target = %peer, this_peer = %self.bridge.op_manager.ring.get_peer_key().unwrap(), "Connection status: {:?}", conn.is_closed());
                 conn.send(Either::Left(*net_msg))
                     .await
                     .map_err(|_| ConnectionError::SendNotCompleted)?;
