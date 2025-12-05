@@ -21,6 +21,10 @@ mod received_packet_tracker;
 mod sent_packet_tracker;
 mod symmetric_message;
 
+// Experimental: Stream-based transport spike (isolated from production code)
+#[cfg(test)]
+mod streaming_spike;
+
 type MessagePayload = Vec<u8>;
 
 type PacketId = u32;
