@@ -457,8 +457,159 @@ impl StreamHandle {
 
 5. **Congestion control**: How does streaming interact with the existing rate limiter?
 
+## Feature Flag Rollout Strategy
+
+### Runtime Configuration
+
+```rust
+// In config.rs
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportConfig {
+    /// Enable stream-based transport for large messages
+    /// Default: false (Phase 1-2), true (Phase 3+)
+    pub streaming_enabled: bool,
+
+    /// Size threshold above which to use streaming (if enabled)
+    /// Default: 64KB
+    pub streaming_threshold_bytes: usize,
+
+    /// Enable piped forwarding (forward without full reassembly)
+    /// Default: false initially
+    pub piped_forwarding: bool,
+
+    /// Shadow mode: run both paths, compare results, use traditional
+    /// Only for Phase 1 validation
+    pub streaming_shadow_mode: bool,
+}
+
+impl Default for TransportConfig {
+    fn default() -> Self {
+        Self {
+            streaming_enabled: false,
+            streaming_threshold_bytes: 64 * 1024,
+            piped_forwarding: false,
+            streaming_shadow_mode: false,
+        }
+    }
+}
+```
+
+### Environment Variables
+
+```bash
+FREENET_STREAMING=true              # Enable streaming transport
+FREENET_STREAMING_THRESHOLD=65536   # Size threshold in bytes
+FREENET_PIPED_FORWARDING=true       # Enable piped forwarding
+FREENET_STREAMING_SHADOW=true       # Shadow mode for validation
+```
+
+### Rollout Phases
+
+#### Phase 1: Shadow Mode
+- **Purpose**: Validate correctness without affecting production
+- **Config**: `streaming_shadow_mode = true`
+- **Behavior**: Both code paths execute, results compared, traditional result used
+- **Metrics**: Log discrepancies between streaming and traditional results
+- **Exit criteria**: Zero discrepancies over test period
+
+```rust
+async fn send_message(&mut self, data: &[u8]) -> Result<()> {
+    if config.streaming_shadow_mode && data.len() > config.streaming_threshold_bytes {
+        // Run both, compare, log differences, return traditional result
+        let (trad_result, stream_result) = tokio::join!(
+            self.send_traditional(data),
+            self.send_streaming(data)
+        );
+        if trad_result != stream_result {
+            tracing::warn!("Streaming/traditional mismatch");
+        }
+        return trad_result;
+    }
+    // Normal path...
+}
+```
+
+#### Phase 2: Opt-In
+- **Purpose**: Early adopter testing in real networks
+- **Config**: `streaming_enabled = false` (default), users opt-in
+- **CLI**: `freenet --streaming-transport`
+- **Exit criteria**: Positive feedback, no regressions reported
+
+#### Phase 3: Default On
+- **Purpose**: Full production deployment
+- **Config**: `streaming_enabled = true` (new default)
+- **CLI**: `freenet --no-streaming-transport` to disable
+- **Exit criteria**: Stable for 2-3 release cycles
+
+#### Phase 4: Legacy Removal
+- **Purpose**: Remove traditional code path, simplify codebase
+- **Actions**:
+  - Remove feature flags
+  - Remove traditional send/recv code
+  - Streaming becomes only implementation
+- **Timing**: After Phase 3 stable for 2-3 releases
+
+### Emergency Rollback
+
+```rust
+/// Global kill switch - instantly disables streaming
+pub static STREAMING_KILL_SWITCH: AtomicBool = AtomicBool::new(false);
+
+impl TransportConfig {
+    pub fn streaming_active(&self) -> bool {
+        !STREAMING_KILL_SWITCH.load(Ordering::Relaxed) && self.streaming_enabled
+    }
+}
+```
+
+### Peer Capability Negotiation
+
+```rust
+#[derive(Serialize, Deserialize)]
+struct PeerCapabilities {
+    protocol_version: u32,
+    streaming_supported: bool,
+    piped_forwarding_supported: bool,
+}
+
+// During handshake
+fn negotiate_mode(&self, remote: &PeerCapabilities) -> TransportMode {
+    if self.config.streaming_active() && remote.streaming_supported {
+        if self.config.piped_forwarding && remote.piped_forwarding_supported {
+            TransportMode::StreamingPiped
+        } else {
+            TransportMode::StreamingReassemble
+        }
+    } else {
+        TransportMode::Traditional
+    }
+}
+```
+
+### Monitoring
+
+```rust
+// Key metrics to track
+streaming_messages_total{mode="streaming|traditional"}
+streaming_bytes_total{mode="streaming|traditional"}
+streaming_latency_seconds{phase="first_fragment|complete"}
+streaming_buffer_bytes_max
+streaming_errors_total{type="timeout|buffer_overflow|mismatch"}
+```
+
+## Spike Validation Results
+
+The spike (`crates/core/src/transport/streaming_spike.rs`) validated:
+
+1. **Zero-copy buffer sharing** - `bytes::Bytes` works as expected
+2. **In-order delivery** - 0 bytes buffered (100% memory saved)
+3. **Realistic reordering** - 0.2% of data buffered (12KB for 5MB)
+4. **Handle sharing** - Multiple readers share same buffer efficiently
+5. **Performance** - 1,338 MB/s throughput, 106µs first-fragment latency
+
 ## References
 
 - Current transport implementation: `crates/core/src/transport/`
 - Existing stream handling: `peer_connection/outbound_stream.rs`, `inbound_stream.rs`
 - Contract structures: `freenet_stdlib::prelude::ContractContainer`
+- Spike implementation: `crates/core/src/transport/streaming_spike.rs`
