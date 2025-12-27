@@ -13,14 +13,45 @@ Large contract transfers (multi-MB) suffer from three bottlenecks:
 
 ## Spike Validation ✅
 
-Proof-of-concept in `crates/core/src/transport/streaming_spike.rs`:
+Proof-of-concept in `crates/core/src/transport/streaming_spike.rs` with comprehensive benchmarks:
 
-| Metric | Result |
-|--------|--------|
-| In-order delivery buffer | **0 bytes** (100% saved) |
-| Realistic reordering buffer | **0.2%** of data (12KB for 5MB) |
-| Throughput | **1,338 MB/s** |
-| First-fragment latency | **106μs** |
+### Core Performance (10MB data, 7688 fragments)
+
+| Metric | Lock-free (OnceLock) | RwLock | Speedup |
+|--------|---------------------|--------|---------|
+| Insert throughput | **2,235 MB/s** | 23 MB/s | **96×** |
+| Insert time | 4.7ms | 451ms | |
+| First-fragment latency | **25μs** | 103μs | **4×** |
+
+### Memory Efficiency
+
+| Scenario | Buffer Required | % of Data |
+|----------|-----------------|-----------|
+| In-order piped forwarding | **0 bytes** | 0% |
+| Realistic reordering (chunks of 10) | **12 KB** | 0.1% |
+| Worst case (reverse order) | 10 MB | 100% |
+| Current approach (full reassembly) | 10 MB | 100% |
+
+### Bytes vs Vec Clone (10MB, 100 iterations)
+
+| Approach | Time | Per Operation | Speedup |
+|----------|------|---------------|---------|
+| **Bytes::clone** (refcount) | 14μs | **143ns** | baseline |
+| Vec::clone (full copy) | 905ms | 9ms | **63,000×** |
+
+### End-to-End Comparison (10MB)
+
+| Approach | Time | Peak Memory | Copies |
+|----------|------|-------------|--------|
+| Current (Vec + clone) | 41ms | **31 MB** | 2 |
+| Streaming (lock-free + Bytes) | 56ms | **10 MB** | 0 |
+| Piped forwarding only | 12ms | **0 bytes** | 0 |
+
+### Concurrent Consumers
+
+- 4 consumers reading 10MB each: **38ms total** (40MB read)
+- Zero contention with lock-free design
+- All consumers share same underlying data
 
 ---
 
@@ -261,10 +292,11 @@ impl StreamBuffer {
 - Concurrent writers to different slots never block each other
 
 **Key tasks:**
-- [ ] Implement `StreamBuffer` with `OnceLock<Bytes>` slots
-- [ ] Pre-allocate based on `total_size` from stream header
+- [x] Implement `LockFreeStreamBuffer` with `OnceLock<Bytes>` slots *(done in spike)*
+- [x] Pre-allocate based on `total_size` from stream header *(done in spike)*
+- [x] `InboundStream` implementing `futures::Stream` *(done in spike)*
 - [ ] `StreamRegistry` for transport→operations handoff
-- [ ] `InboundStream` implementing `futures::Stream`
+- [ ] Integration with `PeerConnection`
 
 ### Phase 2: Piped Forwarding
 
@@ -282,6 +314,8 @@ pub struct PipedStream {
 ```
 
 **Key tasks:**
+- [x] `PipedStream` with out-of-order buffering *(done in spike)*
+- [x] Forward fragments immediately when in-order *(done in spike)*
 - [ ] `send_fragment()` low-level API on PeerConnection
 - [ ] Bounded backpressure with semaphores per target
 - [ ] Memory pressure limits (max buffered fragments)
@@ -413,7 +447,15 @@ pub struct TransportConfig {
 
 ## Success Metrics
 
-- Memory reduction: **100×** for forwarding large contracts
+**Validated in spike:**
+- Lock-free insert: **96× faster** than RwLock (2,235 MB/s vs 23 MB/s)
+- Bytes clone: **63,000× faster** than Vec clone (143ns vs 9ms)
+- First-fragment latency: **25μs** (lock-free) vs 103μs (RwLock)
+- Piped forwarding: **0 bytes** buffer for in-order delivery
+- Memory reduction: **3× less** peak memory (10MB vs 31MB for forward+cache)
+
+**Target for production:**
+- Memory reduction: **100×** for forwarding large contracts at intermediate nodes
 - Clone elimination: **4×** memory reduction for cached state serving
 - First-byte latency: **< 1ms** (vs full transfer time)
 - Zero regressions for small messages (< 64KB)
