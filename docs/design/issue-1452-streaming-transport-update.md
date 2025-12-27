@@ -5,15 +5,27 @@
 This document provides a detailed implementation plan for leveraging streaming to optimize large data transfers in Freenet. A proof-of-concept spike has validated the core concepts, and this plan outlines the phases needed to integrate streaming into production.
 
 **Key Benefits:**
-- **Memory reduction**: From 100% buffering (current) to ~0.2% for typical network reordering
-- **Latency improvement**: First-fragment availability in ~106µs vs waiting for complete message
+- **Memory reduction**: From 100% buffering (current) to ~0.1% for typical network reordering
+- **Latency improvement**: First-fragment availability in ~25µs vs waiting for complete message
 - **Forwarding efficiency**: Intermediate nodes can pipe streams without full reassembly
 
-**Spike Validation Results:**
-- In-order delivery: 0 bytes buffered (100% memory saved)
-- Realistic reordering: 0.2% of data buffered (12KB for 5MB transfer)
-- Throughput: 1,338 MB/s
-- First-fragment latency: 106µs
+**Spike Validation Results (10MB data, 7688 fragments):**
+
+| Metric | Lock-free (OnceLock) | RwLock | Speedup |
+|--------|---------------------|--------|---------|
+| Insert throughput | **2,235 MB/s** | 23 MB/s | **96×** |
+| First-fragment latency | **25µs** | 103µs | **4×** |
+
+| Memory Scenario | Buffer Required |
+|-----------------|-----------------|
+| In-order piped forwarding | **0 bytes** |
+| Realistic reordering (chunks of 10) | **12 KB** (0.1%) |
+| Worst case (reverse order) | 10 MB (100%) |
+
+| Clone Operation (10MB, 100 iterations) | Time | Speedup |
+|----------------------------------------|------|---------|
+| **Bytes::clone** (refcount) | 14µs | baseline |
+| Vec::clone (full copy) | 905ms | **63,000×** |
 
 ---
 
@@ -103,48 +115,61 @@ PROPOSED:
 - `crates/core/src/transport/peer_connection/inbound_stream.rs`
 - `crates/core/src/transport/peer_connection.rs`
 
-**New types:**
+**New types (lock-free design validated in spike):**
 
 ```rust
-/// Shared buffer that accumulates incoming stream fragments.
-/// Designed for zero-copy access via `Bytes`.
-pub struct StreamBuffer {
-    /// The actual data buffer
-    data: RwLock<BytesMut>,
-    /// Total expected size (from first fragment)
-    total_size: AtomicU64,
-    /// Contiguous bytes available from start (for ordered reading)
-    contiguous_bytes: AtomicU64,
-    /// Track which fragments we've received (for gap detection)
-    received_fragments: RwLock<Vec<bool>>,
-    /// Notify waiters when new data arrives
+use std::sync::OnceLock;
+use bytes::Bytes;
+
+/// Lock-free buffer using OnceLock for each fragment slot.
+/// 96× faster than RwLock approach (2,235 MB/s vs 23 MB/s).
+pub struct LockFreeStreamBuffer {
+    /// Each slot holds one fragment - OnceLock for lock-free write-once
+    fragments: Box<[OnceLock<Bytes>]>,
+    /// Pre-computed fragment sizes for proper byte counting
+    fragment_sizes: Box<[usize]>,
+    /// Total expected size
+    total_size: u64,
+    /// Number of fragments
+    total_fragments: u32,
+    /// Contiguous fragment count (atomic frontier)
+    contiguous_fragments: AtomicU32,
+    /// Notify waiters when new contiguous data available
     data_available: Notify,
 }
 
-/// A handle to a stream being received. Can be cloned and shared
-/// without copying the underlying data (uses Arc + Bytes).
-#[derive(Clone)]
-pub struct StreamHandle {
-    pub stream_id: StreamId,
-    buffer: Arc<StreamBuffer>,
-    read_position: Arc<AtomicU64>,
+impl LockFreeStreamBuffer {
+    /// Insert fragment - completely lock-free using CAS
+    pub fn insert(&self, fragment_num: u32, data: Bytes) -> bool {
+        let idx = (fragment_num - 1) as usize;
+        // OnceLock::set is lock-free CAS - duplicates are no-ops
+        let _ = self.fragments[idx].set(data);
+        self.advance_frontier();
+        self.is_complete()
+    }
+
+    /// Iterate available fragments - no locks needed
+    pub fn iter_contiguous(&self) -> impl Iterator<Item = &Bytes>;
 }
 
-impl StreamHandle {
-    /// Read available data without blocking
-    pub async fn read_available(&self) -> Bytes;
+/// Consumer handle implementing futures::Stream for async iteration.
+/// Multiple consumers can read from the same buffer independently.
+pub struct InboundStream {
+    buffer: Arc<LockFreeStreamBuffer>,
+    current_fragment: u32,
+}
 
-    /// Async read that waits for more data
-    pub async fn read(&self, max_bytes: usize) -> Bytes;
+impl futures::Stream for InboundStream {
+    type Item = Bytes;
+    // poll_next yields fragments as they become contiguous
+}
 
-    /// Read all data (waits for completion)
-    pub async fn read_all(&self) -> Bytes;
+impl InboundStream {
+    /// Fork into independent consumer with its own position
+    pub fn fork(&self) -> Self;
 
-    /// Check if stream is complete
-    pub fn is_complete(&self) -> bool;
-
-    /// Get a shared handle (cheap Arc clone, fresh read position)
-    pub fn share(&self) -> Self;
+    /// Collect all data into Bytes (waits for completion)
+    pub async fn collect_all(self) -> Bytes;
 }
 ```
 
@@ -161,12 +186,14 @@ impl PeerConnection {
 ```
 
 **Tasks:**
-- [ ] Port `StreamBuffer` from spike to production code
-- [ ] Port `StreamHandle` from spike to production code
+- [x] Implement `LockFreeStreamBuffer` with `OnceLock<Bytes>` slots *(done in spike)*
+- [x] Implement `InboundStream` with `futures::Stream` trait *(done in spike)*
+- [x] Unit tests for out-of-order fragment handling *(done in spike)*
+- [x] Benchmarks comparing lock-free vs RwLock (96× speedup) *(done in spike)*
+- [ ] Port spike implementation to production code
 - [ ] Add `recv_stream_handle()` to PeerConnection
-- [ ] Update existing `recv()` to use StreamHandle internally
-- [ ] Add unit tests for out-of-order fragment handling
-- [ ] Add benchmarks comparing memory usage
+- [ ] Update existing `recv()` to use InboundStream internally
+- [ ] Integration with `StreamRegistry` for transport→operations handoff
 
 ### Phase 2: Piped Streams for Forwarding
 
@@ -216,12 +243,15 @@ impl PeerConnection {
 ```
 
 **Tasks:**
-- [ ] Port `PipedStream` from spike to production code
+- [x] Implement `PipedStream` with out-of-order buffering *(done in spike)*
+- [x] Forward fragments immediately when in-order *(done in spike)*
+- [x] Tests for worst-case (reverse order) delivery *(done in spike)*
+- [x] Benchmarks for piped forwarding memory usage *(done in spike)*
+- [ ] Port spike implementation to production code
 - [ ] Add `send_fragment()` to PeerConnection
 - [ ] Add `pipe_stream()` factory method
 - [ ] Add memory pressure management (max buffered fragments)
 - [ ] Add metrics for bytes_buffered / bytes_forwarded
-- [ ] Add tests for worst-case (reverse order) delivery
 
 ### Phase 3: Message Layer Integration
 
@@ -668,18 +698,21 @@ impl StreamHandle {
 ## Checklist for Implementation
 
 ### Phase 1 Checklist
-- [ ] StreamBuffer implementation with fragment tracking
-- [ ] StreamHandle with async read interface
-- [ ] Notification system for data arrival
-- [ ] Unit tests for buffer management
-- [ ] Memory usage benchmarks
+- [x] LockFreeStreamBuffer with OnceLock<Bytes> slots *(spike)*
+- [x] InboundStream with futures::Stream trait *(spike)*
+- [x] Notification system for data arrival *(spike)*
+- [x] Unit tests for buffer management *(spike)*
+- [x] Memory usage benchmarks (96× speedup) *(spike)*
+- [ ] Port to production code
+- [ ] Integration with PeerConnection
 
 ### Phase 2 Checklist
-- [ ] PipedStream implementation
-- [ ] Out-of-order fragment buffering
+- [x] PipedStream implementation *(spike)*
+- [x] Out-of-order fragment buffering *(spike)*
+- [x] Integration tests for piped forwarding *(spike)*
+- [ ] Port to production code
 - [ ] Memory pressure management
 - [ ] send_fragment() low-level API
-- [ ] Integration tests for piped forwarding
 
 ### Phase 3 Checklist
 - [ ] Streaming message variants
