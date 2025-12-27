@@ -32,6 +32,10 @@ mod sent_packet_tracker;
 mod symmetric_message;
 pub(crate) mod token_bucket;
 
+// Experimental: Stream-based transport spike (isolated from production code)
+#[cfg(test)]
+mod streaming_spike;
+
 type MessagePayload = bytes::Bytes;
 
 type PacketId = u32;
