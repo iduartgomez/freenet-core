@@ -501,6 +501,159 @@ pub enum StreamError {
 4. **Encryption boundaries**: Current encryption is per-packet. Does streaming change nonce management?
    - *Analysis needed*: Current approach should work as each fragment is a separate packet
 
+5. **Serialization framework**: Should we migrate from bincode to a zero-copy framework?
+   - *Recommendation*: Evaluate rkyv for zero-copy deserialization (see section below)
+
+---
+
+## Zero-Copy Serialization Alternatives
+
+Migrating from bincode to a zero-copy framework could eliminate the serialization bottleneck entirely.
+
+**Note:** `rkyv` and `zerocopy` appear in `Cargo.lock` as transitive dependencies (via wasmer and ahash) but are not directly used by freenet-core. `flatbuffers` is used for topology monitoring messages (`schemas/flatbuffers/topology_generated.rs`) but not for core protocol serialization. Adding direct zero-copy serialization for contract/state data would be a new capability.
+
+### Current State: bincode
+
+```rust
+// bincode requires complete object → allocates new Vec<u8>
+let data = bincode::serialize(&contract)?;  // Allocation + copy
+// Later: bincode::deserialize(&data)?      // Another allocation + copy
+```
+
+**Limitations:**
+- Must have complete object in memory before serialization
+- Produces `Vec<u8>` requiring allocation
+- Deserialization copies data again
+
+### Option 1: rkyv (Recommended for Investigation)
+
+[rkyv](https://github.com/rkyv/rkyv) provides zero-copy deserialization - archived data can be accessed directly from the buffer.
+
+```rust
+use rkyv::{Archive, Deserialize, Serialize};
+
+#[derive(Archive, Serialize, Deserialize)]
+struct ContractData {
+    code: Vec<u8>,
+    state: Vec<u8>,
+}
+
+// Serialization: still requires complete object, but...
+let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&contract)?;
+
+// Deserialization: ZERO-COPY - access archived data directly from buffer
+let archived = rkyv::access::<ArchivedContractData, rkyv::rancor::Error>(&bytes)?;
+// `archived.code` points directly into `bytes` - no allocation!
+
+// Can also fully deserialize if needed
+let contract: ContractData = archived.deserialize(&mut rkyv::Infallible)?;
+```
+
+**Benefits:**
+- Zero-copy deserialization from StreamBuffer
+- Archived data can be accessed while stream is still arriving (for known-offset fields)
+- Mature library with good documentation
+
+**Trade-offs:**
+- Archived format is different from live format (need `Archived*` types)
+- Requires `#[derive(Archive)]` on all serialized types
+- Cross-version compatibility needs care
+
+### Option 2: flatbuffers
+
+Already used in the codebase. Good for structured data with schema.
+
+```rust
+// Define schema in .fbs file
+table Contract {
+    code: [ubyte];
+    state: [ubyte];
+}
+
+// Access without deserialization
+let contract = root_as_contract(&buffer)?;
+let code: &[u8] = contract.code().unwrap();  // Zero-copy slice
+```
+
+**Benefits:**
+- Schema-based with code generation
+- Zero-copy access to nested data
+- Good tooling and documentation
+
+**Trade-offs:**
+- Requires .fbs schema files
+- Generated code can be verbose
+- Schema evolution needs planning
+
+### Option 3: zerocopy (For Simple Structs)
+
+Best for fixed-size, repr(C) structs.
+
+```rust
+use zerocopy::{FromBytes, AsBytes};
+
+#[derive(FromBytes, AsBytes)]
+#[repr(C)]
+struct PacketHeader {
+    stream_id: u32,
+    fragment_num: u32,
+    total_size: u64,
+}
+
+// Zero-copy parsing from buffer
+let header = PacketHeader::read_from_prefix(&buffer)?;
+```
+
+**Benefits:**
+- Simplest API
+- No schema or codegen
+- Truly zero overhead
+
+**Trade-offs:**
+- Only works for fixed-size, repr(C) types
+- No variable-length data (strings, vecs)
+- Platform-dependent (endianness)
+
+### Recommendation
+
+**Phase 1-4**: Keep bincode for protocol messages, but optimize the hot path:
+- Use `Bytes` throughout to avoid copies after initial serialization
+- StreamHandle provides zero-copy access to received data
+
+**Future Phase**: Evaluate rkyv migration for ContractContainer/WrappedState:
+- These are the largest serialized objects
+- Zero-copy deserialization would eliminate receiver-side allocation
+- Could access contract metadata before full stream arrives
+
+**Migration path:**
+1. Add rkyv derives alongside existing Serialize/Deserialize
+2. Add capability flag for rkyv-serialized contracts
+3. Support both formats during transition
+4. Deprecate bincode format after network upgrade
+
+### Integration with Streaming
+
+With rkyv, the streaming receiver can:
+```rust
+impl StreamHandle {
+    /// Access archived data directly from buffer (zero-copy)
+    pub fn access_archived<T: Archive>(&self) -> Result<&T::Archived> {
+        let data = self.buffer.get_contiguous().await;
+        rkyv::access::<T::Archived, _>(&data)
+    }
+
+    /// For partial access - read header while stream continues
+    pub fn peek_header<H: Archive>(&self, header_size: usize) -> Option<&H::Archived> {
+        if self.available_bytes() >= header_size {
+            // Safe: we have enough contiguous bytes
+            rkyv::access::<H::Archived, _>(&self.buffer.data[..header_size]).ok()
+        } else {
+            None
+        }
+    }
+}
+```
+
 ---
 
 ## References

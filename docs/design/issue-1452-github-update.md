@@ -81,6 +81,17 @@ struct PeerCapabilities {
 - Default: Streaming enabled by default
 - Cleanup: Remove legacy code path
 
+## Future: Zero-Copy Serialization
+
+Consider migrating from bincode to a zero-copy framework (rkyv, flatbuffers) to eliminate the serialization bottleneck entirely:
+
+| Framework | Benefits | Trade-offs |
+|-----------|----------|------------|
+| **rkyv** | Zero-copy deserialization, access data directly from buffer | Different archived format, requires derives |
+| **flatbuffers** | Already used for topology, schema-based | Requires .fbs files, generated code |
+
+**Recommendation:** Keep bincode for Phase 1-4, evaluate rkyv for ContractContainer/WrappedState in a future phase. Zero-copy deserialization would allow accessing contract metadata before the full stream arrives.
+
 ## Configuration
 
 ```rust
